@@ -1,0 +1,107 @@
+name: Sync from NOAA-GSL (main & staging → mirror/*)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"     # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: "Space-separated branches to mirror from upstream"
+        required: false
+        default: "main staging"
+      push_tags:
+        description: "Also mirror tags (true/false)"
+        required: false
+        default: "true"
+      force:
+        description: "Force push (true/false)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-zyra
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Mirror upstream to mirror/* in HacksHaven/zyra
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Set defaults for scheduled runs; workflow_dispatch can override these via inputs.
+      BRANCHES: ${{ github.event.inputs.branches || 'main staging' }}
+      PUSH_TAGS: ${{ github.event.inputs.push_tags || 'true' }}
+      FORCE: ${{ github.event.inputs.force || 'true' }}
+      # Remotes
+      UPSTREAM_URL: https://github.com/NOAA-GSL/zyra.git
+      MIRROR_URL: https://github.com/HacksHaven/zyra.git
+
+    steps:
+      - name: Configure Git
+        run: |
+          git config --global user.name "zyra-sync-bot"
+          git config --global user.email "zyra-sync-bot@example.com"
+          git config --global advice.detachedHead false
+
+      - name: Clone upstream as a mirror
+        run: |
+          set -euo pipefail
+          git clone --mirror "$UPSTREAM_URL" upstream.git
+
+      - name: Push selected branches and (optionally) tags
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}   # PAT needs repo (private) or public_repo (public)
+        run: |
+          set -euo pipefail
+
+          # Inputs & flags
+          BRANCHES="${BRANCHES:-main staging}"
+          PUSH_TAGS="${PUSH_TAGS:-true}"
+          FORCE="${FORCE:-true}"
+          FORCE_FLAG=""
+          if [ "$FORCE" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+
+          # Prepare repo & remotes
+          cd upstream.git
+          git remote set-url origin "$UPSTREAM_URL"
+          # Add authenticated mirror remote (token in URL but won't be echoed unless set -x)
+          git remote add mirror "https://${GH_TOKEN}@${MIRROR_URL#https://}"
+
+          # Get latest & prune deleted refs
+          git fetch --prune origin
+
+          # For each requested branch, push only if SHA differs (skip no-ops)
+          for b in $BRANCHES; do
+            if git show-ref --verify --quiet "refs/heads/$b"; then
+              UP_SHA=$(git rev-parse "refs/heads/$b")
+              MIR_SHA=$(git ls-remote mirror "refs/heads/mirror/$b" | awk '{print $1}' || true)
+              if [ "$UP_SHA" = "$MIR_SHA" ] && [ -n "$MIR_SHA" ]; then
+                echo "mirror/$b is up-to-date ($UP_SHA); skipping push."
+              else
+                echo "Pushing $b → mirror/$b ($UP_SHA != $MIR_SHA)"
+                git push mirror "refs/heads/$b:refs/heads/mirror/$b" $FORCE_FLAG
+              fi
+            else
+              echo "Skip: upstream branch '$b' not found."
+            fi
+          done
+
+          # Tags (optional). We don't diff tag sets—just push; it's fast and idempotent.
+          if [ "$PUSH_TAGS" = "true" ]; then
+            echo "Pushing tags…"
+            git fetch --tags origin
+            git push mirror --tags $FORCE_FLAG
+          else
+            echo "Skipping tags (push_tags=false)."
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Mirror run complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
