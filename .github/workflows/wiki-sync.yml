@@ -1,0 +1,40 @@
+name: Sync Wiki from NOAA-GSL/zyra.wiki → HacksHaven/zyra.wiki
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # once per hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git config
+        run: |
+          git config --global user.name "zyra-wiki-sync-bot"
+          git config --global user.email "zyra-wiki-sync-bot@example.com"
+
+      - name: Clone upstream wiki (bare)
+        run: git clone --bare https://github.com/NOAA-GSL/zyra.wiki.git upstream.wiki.git
+
+      - name: Push to HacksHaven wiki
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd upstream.wiki.git
+          git fetch -p
+          # add mirror remote (idempotent, but fail if URL differs)
+          if git remote get-url mirror >/dev/null 2>&1; then
+            git remote set-url mirror "https://x-access-token:${GITHUB_TOKEN}@github.com/HacksHaven/zyra.wiki.git"
+          else
+            git remote add mirror "https://x-access-token:${GITHUB_TOKEN}@github.com/HacksHaven/zyra.wiki.git"
+          fi
+          git push mirror --mirror
