@@ -46,34 +46,35 @@
 ### Short-lived branches
 - **Create in downstream (`HacksHaven/zyra`)**, not upstream.  
 - Prefixes:
-  ```
-  codex/<slug>
-  feat/<slug>-<issue#>
-  fix/<slug>-<issue#>
-  docs/<slug>
-  chore/<slug>
-  ```
-  Examples:
-  - `codex/add-cli-tests`
-  - `feat/new-login-flow-742`
-  - `fix/null-ref-803`
+```
+codex/<slug>
+feat/<slug>-<issue#>
+fix/<slug>-<issue#>
+docs/<slug>
+chore/<slug>
+```
+
+Examples:
+- `codex/add-cli-tests`
+- `feat/new-login-flow-742`
+- `fix/null-ref-803`
 
 ---
 
 ## Where to Create New Code
 
 1. **With write access here (Codex or human):**
-   - Base your branch from `mirror/staging`.
-   - Create `codex/*` (or `feat/*`) branch.
-   - Open a PR with `base = mirror/staging`.
+ - Base your branch from `mirror/staging`.
+ - Create `codex/*` (or `feat/*`) branch.
+ - Open a PR with `base = mirror/staging`.
 
 2. **Relay workflow does the rest:**
-   - Rebases your branch onto upstream `staging`.
-   - Pushes branch `relay/hh-pr-<number>` in org repo.
-   - Creates or updates a PR upstream.
+ - Rebases your branch onto upstream `staging`.
+ - Pushes branch `relay/hh-pr-<number>` in org repo.
+ - Creates or updates a PR upstream.
 
 3. **Reviews and merges happen upstream** (`NOAA-GSL/zyra`).  
-   Your downstream PR will stay open but should not be merged manually.
+ Your downstream PR will stay open but should not be merged manually.
 
 ---
 
@@ -100,11 +101,7 @@ git rebase origin/mirror/staging
 git push -u origin codex/add-cli-tests
 ```
 
----
-
-## Commit Messages
-
-Follow **Conventional Commits**:
+Follow Conventional Commits:
 
 ```
 <type>(scope?): short summary
@@ -182,5 +179,3 @@ A: Use a temporary non-mirror branch (`hotfix/<slug>`). Coordinate with maintain
 
 - Primary maintenance: Upstream maintainers (`NOAA-GSL/zyra`).  
 - Downstream mirror & relay automation: GitHub Actions in this repo.  
-
-Happy shipping! 🚢

@@ -9,6 +9,8 @@ canonical org repo.
 [NOAA-GSL organization repo](https://github.com/NOAA-GSL/zyra) for issues,
 pull requests, releases, and active development.
 
+---
+
 ## How it works
 
 ### 1. Mirror Sync
@@ -23,7 +25,7 @@ pull requests, releases, and active development.
 - Skips pushes if the branch SHA hasn’t changed (no-op runs).
 
 ### 2. Local Branches
-- AI creates branches in this repo under the prefix `codex/*`.
+- Codex (or developers using the provided helper) create branches in this repo under the prefix `codex/*`.
 - PRs are opened here with `base = mirror/staging`.
 
 ### 3. Relay Workflow
@@ -33,6 +35,16 @@ pull requests, releases, and active development.
   `relay/hh-pr-<number>`.
 - Creates or updates a PR in the org repo with base = `staging`.
 - Closes the org PR automatically if the HH PR is closed.
+- Requires the `SYNC_PAT_ORG` secret with **push + PR rights** in the upstream org.
+
+---
+
+## Example Flow
+
+1. Mirror sync updates `mirror/staging` from upstream.
+2. Developer runs `new-branch.sh codex/my-feature` to create a branch.
+3. PR is opened in **HacksHaven/zyra** with base = `mirror/staging`.
+4. Relay bot mirrors the PR to **NOAA-GSL/zyra:staging** as `relay/hh-pr-###`.
 
 ---
 
@@ -63,7 +75,6 @@ pull requests, releases, and active development.
       branches-ignore:
         - 'mirror/**'
   ```
-
 ---
 
 ## Inputs
@@ -81,6 +92,7 @@ branches: "main"
 push_tags: "true"
 force: "true"
 ```
+
 
 This will create/update `mirror/main` and mirror all upstream tags.
 
@@ -101,7 +113,7 @@ This will create/update `mirror/main` and mirror all upstream tags.
 
 ### TL;DR
 - ✅ Keeps NOAA-GSL code mirrored here under `mirror/*`.  
-- ✅ Provides a safe place for Codex to open PRs.  
+- ✅ Provides a safe place for Codex (and helpers) to open PRs.  
 - ✅ Relays Codex PRs upstream into NOAA-GSL/zyra:staging.  
 - ✅ Prevents running unwanted upstream Actions.  
 - ✅ Protects your own workflows and content.  
@@ -111,8 +123,7 @@ This will create/update `mirror/main` and mirror all upstream tags.
 
 ## Where to contribute
 
-If you want to contribute code, file issues, or discuss features, use the **upstream repo**:
+If you want to contribute code, file issues, or discuss features, use the **upstream repo**:  
 👉 [NOAA-GSL/zyra](https://github.com/NOAA-GSL/zyra)
 
 This downstream is read-only, maintained by automation.
-
