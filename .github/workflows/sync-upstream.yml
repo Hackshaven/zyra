@@ -1,4 +1,4 @@
-name: Sync from NOAA-GSL (main & staging → mirror/*)
+name: Sync from NOAA-GSL (main & staging → mirror/*, no upstream actions)
 
 on:
   schedule:
@@ -10,14 +10,15 @@ on:
         required: false
         default: "main staging"
       push_tags:
-        description: "Also mirror tags (true/false)"
+        description: "Also mirror tags? (true/false). Defaults to false to avoid release jobs."
         required: false
-        default: "true"
+        default: "false"
       force:
-        description: "Force push (true/false)"
+        description: "Force push? (true/false)"
         required: false
         default: "true"
 
+# GITHUB_TOKEN needs write to push to *this* repo; we are not touching workflow files after stripping.
 permissions:
   contents: write
 
@@ -27,17 +28,17 @@ concurrency:
 
 jobs:
   sync:
-    name: Mirror upstream to mirror/* in HacksHaven/zyra
+    name: Mirror upstream to mirror/* (workflows stripped)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     env:
-      # Defaults for scheduled runs; workflow_dispatch can override via inputs.
       BRANCHES: ${{ github.event.inputs.branches || 'main staging' }}
-      PUSH_TAGS: ${{ github.event.inputs.push_tags || 'true' }}
+      PUSH_TAGS: ${{ github.event.inputs.push_tags || 'false' }}
       FORCE: ${{ github.event.inputs.force || 'true' }}
       UPSTREAM_URL: https://github.com/NOAA-GSL/zyra.git
-      MIRROR_URL: https://github.com/HacksHaven/zyra.git
+      # Use canonical/case-stable path to avoid redirect noise
+      MIRROR_URL: https://github.com/Hackshaven/zyra.git
 
     steps:
       - name: Configure Git
@@ -51,24 +52,32 @@ jobs:
           set -euo pipefail
           git clone --mirror "$UPSTREAM_URL" upstream.git
 
-      - name: Push selected branches and (optionally) tags
+      - name: Strip upstream workflow files from history (prevent running their actions)
+        run: |
+          set -euo pipefail
+          cd upstream.git
+          # Install git-filter-repo for path rewriting
+          python -m pip install --user git-filter-repo
+          # Remove all files under .github/workflows from the repo history
+          git filter-repo --path .github/workflows --invert-paths --force
+
+      - name: Push selected branches (and optional tags) to mirror/*
         env:
-          GITHUB_TOKEN: ${{ github.token }}  # built-in token for this repo
+          GITHUB_TOKEN: ${{ github.token }}   # built-in token for same-repo pushes
         run: |
           set -euo pipefail
 
           BRANCHES="${BRANCHES:-main staging}"
-          PUSH_TAGS="${PUSH_TAGS:-true}"
+          PUSH_TAGS="${PUSH_TAGS:-false}"
           FORCE="${FORCE:-true}"
           FORCE_FLAG=""
           [ "$FORCE" = "true" ] && FORCE_FLAG="--force"
 
           cd upstream.git
-
-          # Authenticated remote using GITHUB_TOKEN (same-repo writes)
+          # Authenticated remote using built-in token
           git remote add mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}"
 
-          # Get latest & prune deleted refs
+          # Ensure latest & prune deleted refs from upstream
           git fetch --prune origin
 
           # For each requested branch, push only if SHA differs (skip no-ops)
@@ -87,9 +96,9 @@ jobs:
             fi
           done
 
-          # Tags (optional). Fast & idempotent.
+          # Tags are where many release workflows trigger; default is OFF.
           if [ "$PUSH_TAGS" = "true" ]; then
-            echo "Pushing tags…"
+            echo "Pushing tags (note: upstream workflows are stripped from history)."
             git fetch --tags origin
             git push mirror --tags $FORCE_FLAG
           else
@@ -98,4 +107,5 @@ jobs:
 
       - name: Summary
         if: always()
-        run: echo "Mirror run complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
+        run: echo "Mirror (workflows stripped) complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
+        
