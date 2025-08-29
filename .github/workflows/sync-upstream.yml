@@ -32,11 +32,10 @@ jobs:
     timeout-minutes: 10
 
     env:
-      # Set defaults for scheduled runs; workflow_dispatch can override these via inputs.
+      # Defaults for scheduled runs; workflow_dispatch can override via inputs.
       BRANCHES: ${{ github.event.inputs.branches || 'main staging' }}
       PUSH_TAGS: ${{ github.event.inputs.push_tags || 'true' }}
       FORCE: ${{ github.event.inputs.force || 'true' }}
-      # Remotes
       UPSTREAM_URL: https://github.com/NOAA-GSL/zyra.git
       MIRROR_URL: https://github.com/HacksHaven/zyra.git
 
@@ -54,24 +53,20 @@ jobs:
 
       - name: Push selected branches and (optionally) tags
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}   # PAT needs repo (private) or public_repo (public)
+          GITHUB_TOKEN: ${{ github.token }}  # built-in token for this repo
         run: |
           set -euo pipefail
 
-          # Inputs & flags
           BRANCHES="${BRANCHES:-main staging}"
           PUSH_TAGS="${PUSH_TAGS:-true}"
           FORCE="${FORCE:-true}"
           FORCE_FLAG=""
-          if [ "$FORCE" = "true" ]; then
-            FORCE_FLAG="--force"
-          fi
+          [ "$FORCE" = "true" ] && FORCE_FLAG="--force"
 
-          # Prepare repo & remotes
           cd upstream.git
-          git remote set-url origin "$UPSTREAM_URL"
-          # Add authenticated mirror remote (token in URL but won't be echoed unless set -x)
-          git remote add mirror "https://${GH_TOKEN}@${MIRROR_URL#https://}"
+
+          # Authenticated remote using GITHUB_TOKEN (same-repo writes)
+          git remote add mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}"
 
           # Get latest & prune deleted refs
           git fetch --prune origin
@@ -81,10 +76,10 @@ jobs:
             if git show-ref --verify --quiet "refs/heads/$b"; then
               UP_SHA=$(git rev-parse "refs/heads/$b")
               MIR_SHA=$(git ls-remote mirror "refs/heads/mirror/$b" | awk '{print $1}' || true)
-              if [ "$UP_SHA" = "$MIR_SHA" ] && [ -n "$MIR_SHA" ]; then
+              if [ -n "${MIR_SHA}" ] && [ "$UP_SHA" = "$MIR_SHA" ]; then
                 echo "mirror/$b is up-to-date ($UP_SHA); skipping push."
               else
-                echo "Pushing $b → mirror/$b ($UP_SHA != $MIR_SHA)"
+                echo "Pushing $b → mirror/$b ($UP_SHA != ${MIR_SHA:-none})"
                 git push mirror "refs/heads/$b:refs/heads/mirror/$b" $FORCE_FLAG
               fi
             else
@@ -92,7 +87,7 @@ jobs:
             fi
           done
 
-          # Tags (optional). We don't diff tag sets—just push; it's fast and idempotent.
+          # Tags (optional). Fast & idempotent.
           if [ "$PUSH_TAGS" = "true" ]; then
             echo "Pushing tags…"
             git fetch --tags origin
@@ -103,5 +98,4 @@ jobs:
 
       - name: Summary
         if: always()
-        run: |
-          echo "Mirror run complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
+        run: echo "Mirror run complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
