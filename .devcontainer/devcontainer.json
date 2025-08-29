@@ -1,0 +1,49 @@
+{
+  "name": "Zyra Downstream (mirror-aware)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    }
+  },
+  "remoteEnv": {
+    "UPSTREAM_URL": "https://github.com/NOAA-GSL/zyra.git",
+    "MIRROR_BASE": "mirror/staging",
+    "MIRROR_MAIN": "mirror/main"
+  },
+  "postCreateCommand": "bash .devcontainer/scripts/setup.sh",
+  "postStartCommand": "bash .devcontainer/scripts/post-start.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "github.vscode-pull-request-github",
+        "eamodio.gitlens",
+        "mhutchie.git-graph",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "gitlens.views.remotes.show": true,
+        "git-graph.showRemoteBranches": true,
+        "git.confirmSync": false,
+        "git.autofetch": true,
+        "git.pruneOnFetch": true,
+        "git.enableSmartCommit": true,
+        "files.trimTrailingWhitespace": true,
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "mounts": [],
+  "updateContentCommand": ""
+}
