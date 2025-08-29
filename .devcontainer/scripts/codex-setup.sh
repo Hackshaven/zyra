@@ -10,10 +10,10 @@ git lfs install --skip-smudge
 git config filter.lfs.smudge "git-lfs smudge --skip -- %f"
 git config filter.lfs.required true
 
-# Ensure remotes
-if ! git remote get-url origin >/dev/null 2>&1; then
-  git remote add origin https://github.com/HacksHaven/zyra.git
-fi
+# Ensure remotes (reset origin if already exists)
+git remote remove origin 2>/dev/null || true
+git remote add origin https://github.com/HacksHaven/zyra.git
+
 git remote remove upstream 2>/dev/null || true
 git remote add upstream https://github.com/NOAA-GSL/zyra.git
 
@@ -25,7 +25,7 @@ if git show-ref --quiet refs/remotes/origin/mirror/staging; then
   git checkout mirror/staging
 fi
 
-# Install Poetry + dependencies
+# Install Poetry + dependencies if pyproject.toml exists
 if ! command -v poetry >/dev/null 2>&1; then
   pip install poetry
 fi
