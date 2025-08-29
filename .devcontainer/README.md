@@ -69,6 +69,9 @@ The devcontainer is **mirror-aware**:
 - Provides humans with one-command helpers (`new-branch`) to avoid mistakes.
 - Ensures downstream contributions can be cleanly relayed back into `NOAA-GSL/zyra`.
 
+- **LFS mirrored**: All Git LFS objects from the upstream repo are also mirrored into this downstream, so you can safely check out `mirror/*` branches without missing asset errors. Large files are available locally without needing to fetch from upstream.
+
+
 ---
 
 ### TL;DR

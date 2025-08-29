@@ -1,4 +1,4 @@
-name: Sync from NOAA-GSL (main & staging → mirror/*, no upstream actions)
+name: Sync from NOAA-GSL (main & staging → mirror/*, workflows stripped + LFS mirrored)
 
 on:
   schedule:
@@ -27,9 +27,9 @@ concurrency:
 
 jobs:
   sync:
-    name: Mirror upstream to mirror/* (workflows stripped)
+    name: Mirror upstream to mirror/* (workflows stripped + LFS mirrored)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     env:
       BRANCHES: ${{ github.event.inputs.branches || 'main staging' }}
@@ -46,6 +46,15 @@ jobs:
           git config --global user.email "zyra-sync-bot@example.com"
           git config --global advice.detachedHead false
 
+      # --- LFS support (install) ---
+      - name: Install Git LFS (if needed)
+        run: |
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y git-lfs
+          fi
+          git lfs install
+
       - name: Clone upstream as a mirror
         run: |
           set -euo pipefail
@@ -60,7 +69,7 @@ jobs:
           # Remove all files under .github/workflows from the repo history
           git filter-repo --path .github/workflows --invert-paths --force
 
-      - name: Push selected branches (and optional tags) to mirror/*
+      - name: Push selected branches (and optional tags) to mirror/*  (with LFS)
         env:
           GITHUB_TOKEN: ${{ github.token }}   # built-in token for same-repo pushes
         run: |
@@ -81,6 +90,12 @@ jobs:
 
           # Ensure latest & prune deleted refs from upstream
           git fetch --prune origin
+
+          # --- LFS support (mirror blobs as well) ---
+          # 1) Pull all LFS objects referenced in upstream
+          git lfs fetch origin --all || true
+          # 2) Push all LFS objects into the downstream mirror's LFS store
+          git lfs push mirror --all || true
 
           # For each requested branch, push only if SHA differs (skip no-ops)
           for b in $BRANCHES; do
@@ -109,5 +124,4 @@ jobs:
 
       - name: Summary
         if: always()
-        run: echo "Mirror (workflows stripped) complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
-        
+        run: echo "Mirror (workflows stripped + LFS mirrored) complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
