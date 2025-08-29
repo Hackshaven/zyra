@@ -18,9 +18,8 @@ on:
         required: false
         default: "true"
 
-# GITHUB_TOKEN needs write to push to *this* repo; we are not touching workflow files after stripping.
 permissions:
-  contents: write
+  contents: write   # allows GITHUB_TOKEN to push to THIS repo
 
 concurrency:
   group: mirror-zyra
@@ -37,7 +36,7 @@ jobs:
       PUSH_TAGS: ${{ github.event.inputs.push_tags || 'false' }}
       FORCE: ${{ github.event.inputs.force || 'true' }}
       UPSTREAM_URL: https://github.com/NOAA-GSL/zyra.git
-      # Use canonical/case-stable path to avoid redirect noise
+      # Use canonical (case-stable) URL to avoid redirect noise
       MIRROR_URL: https://github.com/Hackshaven/zyra.git
 
     steps:
@@ -56,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           cd upstream.git
-          # Install git-filter-repo for path rewriting
+          # Install git-filter-repo (available via pip on the runner)
           python -m pip install --user git-filter-repo
           # Remove all files under .github/workflows from the repo history
           git filter-repo --path .github/workflows --invert-paths --force
@@ -74,8 +73,11 @@ jobs:
           [ "$FORCE" = "true" ] && FORCE_FLAG="--force"
 
           cd upstream.git
-          # Authenticated remote using built-in token
-          git remote add mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}"
+
+          # git filter-repo drops remotes; recreate them now
+          git remote add origin "$UPSTREAM_URL" || git remote set-url origin "$UPSTREAM_URL"
+          git remote add mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}" || \
+            git remote set-url mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}"
 
           # Ensure latest & prune deleted refs from upstream
           git fetch --prune origin
@@ -98,7 +100,7 @@ jobs:
 
           # Tags are where many release workflows trigger; default is OFF.
           if [ "$PUSH_TAGS" = "true" ]; then
-            echo "Pushing tags (note: upstream workflows are stripped from history)."
+            echo "Pushing tags (note: upstream workflows have been stripped)."
             git fetch --tags origin
             git push mirror --tags $FORCE_FLAG
           else
