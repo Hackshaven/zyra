@@ -1,0 +1,40 @@
+name: Sync from NOAA-GSL (main & staging → mirror/*)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git config
+        run: |
+          git config --global user.name "zyra-sync-bot"
+          git config --global user.email "zyra-sync-bot@example.com"
+
+      - name: Clone upstream (bare)
+        run: git clone --bare https://github.com/NOAA-GSL/zyra.git upstream.git
+
+      - name: Push to HacksHaven as mirror branches
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          cd upstream.git
+          git fetch --all -p
+          cd ..
+          git clone upstream.git work && cd work
+
+          for b in main staging; do
+            if git show-ref --verify --quiet refs/remotes/origin/$b; then
+              git switch --detach origin/$b
+              git push https://$GH_TOKEN@github.com/HacksHaven/zyra.git HEAD:refs/heads/mirror/$b -f
+            fi
+          done
+
+          git fetch origin --tags
+          git push https://$GH_TOKEN@github.com/HacksHaven/zyra.git --tags --force
