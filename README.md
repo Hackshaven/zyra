@@ -698,7 +698,8 @@ with open("/data/out/movie.mp4", "rb") as f:
 - Paths: examples use absolute paths (e.g., `/data/...`) for clarity, but the library does not assume a specific root; configure paths via your own settings or env vars if preferred.
 - Credentials: do not commit secrets; AWS and Vimeo creds should come from env or secure stores used by `CredentialManager`.
 - Dependencies: video flows require system `ffmpeg`/`ffprobe`.
- - Optional extras: see "Install (pip extras)" for targeted installs.
+- Optional extras: see "Install (pip extras)" for targeted installs.
+- This note is a test addition to validate the workflow.
 
 CAPABILITIES vs. FEATURES:
 - Acquisition managers expose `capabilities` (remote I/O actions), e.g. `{'fetch','upload','list'}` for S3/FTP; `{'fetch'}` for HTTP; `{'upload'}` for Vimeo.
