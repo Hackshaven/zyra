@@ -1,4 +1,3 @@
-# .github/workflows/relay-to-org.yml
 name: Relay Codex PRs to NOAA-GSL/zyra
 
 on:
@@ -94,7 +93,7 @@ jobs:
             core.setOutput('is_closed', String(pr.state === 'closed'));
             core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
 
-      # -------- Checkout the PR head (PR_TARGET loads workflow from default branch) --------
+      # -------- Checkout the PR head (pull_request_target loads workflow from default branch) --------
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
@@ -124,73 +123,128 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      # -------- Rebase with light auto-resolve (infra + dependency manifests), non-interactive --------
-      - name: Rebase onto upstream base (auto-resolve safe paths)
+      # -------- Robust rebase loop with allowlisted auto-resolve, non-interactive --------
+      - name: Rebase onto upstream base (looping auto-resolve)
         id: rebase
         shell: bash
         run: |
           set -euo pipefail
           export GIT_EDITOR=true
 
-          # First try a straight rebase (non-interactive)
+          # Quick path: try a straight rebase
           if git rebase "upstream/${{ env.RELAY_BASE }}"; then
             echo "conflict=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Rebase conflict detected — attempting light auto-resolve for known-safe paths."
+          echo "Rebase conflict detected — switching to controlled replay with auto-resolve loop."
           git rebase --abort || true
 
-          # Start a controlled rebase: replay our commits onto upstream base
           git checkout -B __relay_work
           git reset --hard "${{ steps.ctx.outputs.head_sha }}"
+
+          # Start rebase onto upstream base
           git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
 
-          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
-            # Always prefer upstream ("theirs") for infra & dependency manifests
-            ALLOWLIST=(
-              # infra/dev experience
-              ".devcontainer/devcontainer.json"
-              ".devcontainer/**"
-              "docker-compose.yml"
-              "Dockerfile"
+          # Allowlist: prefer upstream ("theirs") for these paths when conflicted
+          ALLOWLIST=(
+            # infra/dev experience
+            ".devcontainer/devcontainer.json"
+            ".devcontainer/.*"
+            "docker-compose.yml"
+            "Dockerfile"
 
-              # dependency manifests & locks
-              "pyproject.toml"
-              "poetry.lock"
-              "package.json"
-              "package-lock.json"
-              "pnpm-lock.yaml"
-              "yarn.lock"
+            # dependency manifests & locks
+            "pyproject.toml"
+            "poetry.lock"
+            "package.json"
+            "package-lock.json"
+            "pnpm-lock.yaml"
+            "yarn.lock"
 
-              # Typical version constants (adjust to your layout as needed)
-              "src/**/__init__.py"
+            # Typical version constants
+            "src/.*/__init__\\.py"
 
-              # Do not relay downstream test workflows into upstream
-              ".github/workflows/**"
-            )
+            # Never relay local workflows upstream
+            ".github/workflows/.*"
+          )
 
-            for pattern in "${ALLOWLIST[@]}"; do
-              regex="^${pattern//\*/.*}$"
-              matches=$(git diff --name-only --diff-filter=U | grep -E "${regex}" || true)
-              if [ -n "${matches}" ]; then
-                echo "Auto-resolving (prefer upstream) for:"
-                echo "${matches}"
-                while IFS= read -r f; do
-                  [ -z "$f" ] && continue
-                  git checkout --theirs -- "$f" || true
-                  git add "$f" || true
-                done <<< "${matches}"
+          # Helper to check if a file path matches any allowlist regex
+          matches_allowlist () {
+            local f="$1"
+            for rx in "${ALLOWLIST[@]}"; do
+              if [[ "$f" =~ ^${rx}$ ]]; then
+                return 0
               fi
             done
+            return 1
+          }
 
-            # Continue rebase non-interactively; if more conflicts remain, report & stop
-            if ! git rebase --continue; then
+          # Loop through rebase conflicts and resolve allowlisted files until done or a non-allowlisted conflict remains
+          iter=0
+          max_iter=50
+          while [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; do
+            ((iter++)) || true
+            if (( iter > max_iter )); then
+              echo "Hit iteration limit while rebasing; aborting."
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
               exit 0
             fi
-          fi
+
+            echo "Rebase auto-resolve iteration ${iter}…"
+            conflicted=$(git diff --name-only --diff-filter=U || true)
+            if [[ -z "$conflicted" ]]; then
+              # Rebase waiting for --continue without listed files
+              if git rebase --continue; then
+                continue
+              else
+                echo "conflict=true" >> "$GITHUB_OUTPUT"
+                git rebase --abort || true
+                exit 0
+              fi
+            fi
+
+            # Try to resolve allowlisted files
+            resolved_any=false
+            while IFS= read -r f; do
+              [[ -z "$f" ]] && continue
+              if matches_allowlist "$f"; then
+                echo "  • Auto-resolving (prefer upstream) $f"
+                git checkout --theirs -- "$f" || true
+                git add "$f" || true
+                resolved_any=true
+              else
+                echo "  • Non-allowlisted conflict: $f"
+                non_allowlisted=true
+              fi
+            done <<< "$conflicted"
+
+            # If we resolved at least one, try to continue; if non-allowlisted remain, stop and report
+            if [[ "${resolved_any}" == "true" ]]; then
+              if git rebase --continue; then
+                # continue loop; there may be more commits/conflicts ahead
+                continue
+              else
+                echo "conflict=true" >> "$GITHUB_OUTPUT"
+                git rebase --abort || true
+                exit 0
+              fi
+            fi
+
+            if [[ "${non_allowlisted:-}" == "true" ]]; then
+              echo "Remaining conflicts are not in allowlist; cannot auto-resolve safely."
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              git rebase --abort || true
+              exit 0
+            fi
+
+            # Fallback: nothing to do, but still stuck → abort
+            echo "Stuck during rebase without resolvable files."
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git rebase --abort || true
+            exit 0
+          done
 
           echo "conflict=" >> "$GITHUB_OUTPUT"
 
@@ -203,16 +257,15 @@ jobs:
             const body = [
               "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
               "",
-              "I auto-resolved common infra files (`.devcontainer/**`, `docker-compose.yml`, `Dockerfile`),",
-              "dependency manifests & locks (`pyproject.toml`, lockfiles, package.json/locks),",
-              "version files (`src/**/__init__.py`), and `.github/workflows/**` by favoring upstream,",
-              "but additional conflicts remain.",
+              "I looped through conflicts and auto-resolved common infra (`.devcontainer/**`, `docker-compose.yml`, `Dockerfile`),",
+              "dependency files (`pyproject.toml`, lockfiles, package.json/locks), version files (`src/**/__init__.py`),",
+              "and `.github/workflows/**` by favoring upstream, but **conflicts remain** outside that allowlist.",
               "",
-              "**Action:** Please rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again.",
+              "**Action:** Rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again.",
               "",
               "**Tips:**",
               "- Keep infra & dependency bumps out of Codex feature PRs when possible.",
-              "- If dependency or workflow changes are required, resolve locally so both repos agree."
+              "- If such changes are necessary, resolve locally so both repos agree."
             ].join("\n");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
