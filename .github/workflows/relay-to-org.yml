@@ -2,18 +2,18 @@
 name: Relay Codex PRs to NOAA-GSL/zyra
 
 on:
-  # Auto: run when a PR targets a mirror branch (base = mirror/staging by default)
+  # Auto: run when a PR targets a mirror branch (base = mirror/staging)
   pull_request_target:
     types: [opened, reopened, synchronize, edited, closed]
     branches:
       - mirror/staging
-      # - 'mirror/**'   # uncomment to allow all mirror bases
+      # - 'mirror/**'   # uncomment to allow any mirror/* base
 
-  # Manual: run from Actions tab with (optional) PR number
+  # Manual: run from Actions tab with optional PR number
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Downstream PR number in HacksHaven/zyra (optional: will pick latest open mirror/* PR if empty)"
+        description: "Downstream PR number in HacksHaven/zyra (optional: picks latest open mirror/* PR if empty)"
         required: false
         type: number
 
@@ -22,19 +22,19 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # Force string using format() to avoid linter errors about int vs string
   group: ${{ format('relay-{0}-{1}', github.event_name, github.event.inputs.pr_number || github.event.pull_request.number) }}
   cancel-in-progress: true
 
 env:
   ORG_OWNER: NOAA-GSL
   ORG_REPO: zyra
+  RELAY_BASE: staging
 
 jobs:
   relay:
     name: Mirror PR to org (create/update/close)
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       # -------- Resolve PR context for both triggers (auto + manual) --------
@@ -64,7 +64,7 @@ jobs:
                   state: 'open',
                   per_page: 50
                 });
-                pr = list.find(p => p.base && p.base.ref && p.base.ref.startsWith('mirror/'));
+                pr = list.find(p => p.base?.ref?.startsWith('mirror/'));
                 if (!pr) {
                   core.setFailed("No open PRs found targeting 'mirror/*'. Provide pr_number when running manually.");
                   return;
@@ -94,7 +94,7 @@ jobs:
             core.setOutput('is_closed', String(pr.state === 'closed'));
             core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
 
-      # -------- Checkout the PR head (for pull_request_target we must specify repo/ref) --------
+      # -------- Checkout the PR head (PR_TARGET loads workflow from default branch) --------
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
@@ -106,14 +106,15 @@ jobs:
         run: |
           git config user.name "relay-bot"
           git config user.email "relay-bot@example.com"
+          git config advice.skippedCherryPicks false
 
-      - name: Ensure upstream staging exists
+      - name: Ensure upstream base exists
         env:
           ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
         run: |
           set -euo pipefail
-          git ls-remote "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" refs/heads/staging | grep -q . || \
-            (echo "::error ::${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}:staging not found" && exit 1)
+          git ls-remote "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" "refs/heads/${{ env.RELAY_BASE }}" | grep -q . || \
+            (echo "::error ::${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}:${{ env.RELAY_BASE }} not found" && exit 1)
 
       - name: Add upstream and fetch base
         env:
@@ -121,16 +122,62 @@ jobs:
         run: |
           set -euo pipefail
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
-          git fetch upstream staging
+          git fetch upstream "${{ env.RELAY_BASE }}"
 
-      - name: Rebase onto org staging
+      # -------- Rebase with light auto-resolve for infra files --------
+      - name: Rebase onto upstream base (auto-resolve infra)
         id: rebase
+        shell: bash
         run: |
-          set -e
-          if ! git rebase upstream/staging; then
-            git rebase --abort
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          # First try a straight rebase
+          if git rebase "upstream/${{ env.RELAY_BASE }}"; then
+            echo "conflict=" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          echo "Rebase conflict detected — attempting light auto-resolve for infra files."
+          git rebase --abort || true
+
+          # Start a controlled rebase: replay our commits onto upstream base
+          git checkout -B __relay_work
+          git reset --hard "${{ steps.ctx.outputs.head_sha }}"
+          git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
+
+          if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+            # Allowlist of infra paths we always prefer from upstream
+            ALLOWLIST=(
+              ".devcontainer/devcontainer.json"
+              ".devcontainer/**"
+              "docker-compose.yml"
+            )
+
+            # Resolve conflicts for allowlisted files by taking 'theirs' (upstream)
+            for pattern in "${ALLOWLIST[@]}"; do
+              # Convert glob to regex-ish for grep
+              regex="^${pattern//\*/.*}$"
+              matches=$(git diff --name-only --diff-filter=U | grep -E "${regex}" || true)
+              if [ -n "${matches}" ]; then
+                echo "Auto-resolving (prefer upstream) for:"
+                echo "${matches}"
+                while IFS= read -r f; do
+                  [ -z "$f" ] && continue
+                  git checkout --theirs -- "$f" || true
+                  git add "$f" || true
+                done <<< "${matches}"
+              fi
+            done
+
+            # Continue rebase; if more conflicts remain, it will fail and we report them
+            if ! git rebase --continue; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              git rebase --abort || true
+              exit 0
+            fi
+          fi
+
+          echo "conflict=" >> "$GITHUB_OUTPUT"
 
       - name: Comment on rebase conflict (downstream PR)
         if: steps.rebase.outputs.conflict == 'true'
@@ -138,10 +185,25 @@ jobs:
         with:
           script: |
             const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
-            const body = `❌ Relay rebase failed on **${process.env.ORG_OWNER}/${process.env.ORG_REPO}:staging**.\n\nPlease rebase this branch onto \`mirror/staging\` and push again. The relay will retry automatically.`
-            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body })
-            core.setFailed('Rebase conflict')
+            const body = [
+              "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
+              "",
+              "I auto-resolved standard infra files (e.g. `.devcontainer/**`, `docker-compose.yml`) by favoring upstream,",
+              "but additional conflicts remain. Please rebase your branch on `mirror/staging` locally and push again.",
+              "",
+              "**Tips:**",
+              "- Keep infra changes (devcontainer / compose) out of Codex feature PRs when possible.",
+              "- If infra changes are required, resolve locally and re-push; the relay will retry automatically."
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+            core.setFailed('Rebase conflict after auto-resolve')
 
+      # -------- Push relay branch to upstream and upsert PR --------
       - name: Push relay branch to org
         if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
         env:
@@ -162,10 +224,10 @@ jobs:
             const relayBranch = process.env.RELAY_BRANCH;
             const owner = process.env.ORG_OWNER;
             const repo  = process.env.ORG_REPO;
-            const base  = 'staging';
+            const base  = process.env.RELAY_BASE;
             const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
 
-            // Load downstream PR to reuse title/body
+            // Reuse downstream PR title/body
             const { data: srcPR } = await github.rest.pulls.get({
               owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
             });
@@ -206,4 +268,5 @@ jobs:
             const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
             for (const pr of prs) {
               await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
-              core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`)
+              core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
+            }
