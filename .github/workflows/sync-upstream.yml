@@ -1,127 +1,344 @@
-name: Sync from NOAA-GSL (main & staging → mirror/*, workflows stripped + LFS mirrored)
+name: Relay Codex PRs to NOAA-GSL/zyra
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"     # every 30 minutes
+  # Auto: run when a PR targets a mirror branch (base = mirror/staging)
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, closed]
+    branches:
+      - mirror/staging
+      # - 'mirror/**'   # uncomment to allow any mirror/* base
+
+  # Manual: run from Actions tab with optional PR number
   workflow_dispatch:
     inputs:
-      branches:
-        description: "Space-separated branches to mirror from upstream"
+      pr_number:
+        description: "Downstream PR number in HacksHaven/zyra (optional: picks latest open mirror/* PR if empty)"
         required: false
-        default: "main staging"
-      push_tags:
-        description: "Also mirror tags? (true/false). Defaults to false to avoid release jobs."
-        required: false
-        default: "false"
-      force:
-        description: "Force push? (true/false)"
-        required: false
-        default: "true"
+        type: number
 
 permissions:
-  contents: write   # allows GITHUB_TOKEN to push to THIS repo
+  contents: read
+  pull-requests: write
 
 concurrency:
-  group: mirror-zyra
-  cancel-in-progress: false
+  group: ${{ format('relay-{0}-{1}', github.event_name, github.event.inputs.pr_number || github.event.pull_request.number) }}
+  cancel-in-progress: true
+
+env:
+  ORG_OWNER: NOAA-GSL
+  ORG_REPO: zyra
+  RELAY_BASE: staging
 
 jobs:
-  sync:
-    name: Mirror upstream to mirror/* (workflows stripped + LFS mirrored)
+  relay:
+    name: Mirror PR to org (create/update/close)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    env:
-      BRANCHES: ${{ github.event.inputs.branches || 'main staging' }}
-      PUSH_TAGS: ${{ github.event.inputs.push_tags || 'false' }}
-      FORCE: ${{ github.event.inputs.force || 'true' }}
-      UPSTREAM_URL: https://github.com/NOAA-GSL/zyra.git
-      # Use canonical (case-stable) URL to avoid redirect noise
-      MIRROR_URL: https://github.com/Hackshaven/zyra.git
+    timeout-minutes: 15
 
     steps:
+      # -------- Resolve PR context for both triggers (auto + manual) --------
+      - name: Resolve PR context
+        id: ctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isManual = context.eventName === 'workflow_dispatch';
+            let pr;
+
+            if (isManual) {
+              const raw = core.getInput('pr_number', { required: false });
+              if (raw) {
+                const prNumber = Number(raw);
+                const { data } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber
+                });
+                pr = data;
+              } else {
+                // pick the latest open PR targeting mirror/*
+                const list = await github.paginate(github.rest.pulls.list, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  per_page: 50
+                });
+                pr = list.find(p => p.base?.ref?.startsWith('mirror/'));
+                if (!pr) {
+                  core.setFailed("No open PRs found targeting 'mirror/*'. Provide pr_number when running manually.");
+                  return;
+                }
+              }
+            } else {
+              pr = context.payload.pull_request;
+            }
+
+            // Fork guard: require same-repo PR (secrets unavailable for forks)
+            const sameRepo = pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
+            if (!sameRepo) {
+              core.setFailed(`PR head repo ${pr.head.repo.full_name} is not this repository; cannot access secrets.`);
+              return;
+            }
+
+            if (!pr.base || !pr.base.ref.startsWith('mirror/')) {
+              core.setFailed(`Base branch '${pr.base?.ref}' is not a mirror/* branch.`);
+              return;
+            }
+
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_repo', pr.head.repo.full_name);
+            core.setOutput('is_closed', String(pr.state === 'closed'));
+            core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
+
+      # -------- Checkout the PR head (pull_request_target loads workflow from default branch) --------
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.ctx.outputs.head_repo }}
+          ref: ${{ steps.ctx.outputs.head_sha }}
+          fetch-depth: 0
+
       - name: Configure Git
         run: |
-          git config --global user.name "zyra-sync-bot"
-          git config --global user.email "zyra-sync-bot@example.com"
-          git config --global advice.detachedHead false
+          git config user.name "relay-bot"
+          git config user.email "relay-bot@example.com"
+          git config advice.skippedCherryPicks false
 
-      # --- LFS support (install) ---
-      - name: Install Git LFS (if needed)
-        run: |
-          if ! command -v git-lfs >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y git-lfs
-          fi
-          git lfs install
-
-      - name: Clone upstream as a mirror
-        run: |
-          set -euo pipefail
-          git clone --mirror "$UPSTREAM_URL" upstream.git
-
-      - name: Strip upstream workflow files from history (prevent running their actions)
-        run: |
-          set -euo pipefail
-          cd upstream.git
-          # Install git-filter-repo (available via pip on the runner)
-          python -m pip install --user git-filter-repo
-          # Remove all files under .github/workflows from the repo history
-          git filter-repo --path .github/workflows --invert-paths --force
-
-      - name: Push selected branches (and optional tags) to mirror/*  (with LFS)
+      - name: Ensure upstream base exists
         env:
-          GITHUB_TOKEN: ${{ github.token }}   # built-in token for same-repo pushes
+          ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
         run: |
           set -euo pipefail
+          git ls-remote "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" "refs/heads/${{ env.RELAY_BASE }}" | grep -q . || \
+            (echo "::error ::${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}:${{ env.RELAY_BASE }} not found" && exit 1)
 
-          BRANCHES="${BRANCHES:-main staging}"
-          PUSH_TAGS="${PUSH_TAGS:-false}"
-          FORCE="${FORCE:-true}"
-          FORCE_FLAG=""
-          [ "$FORCE" = "true" ] && FORCE_FLAG="--force"
+      - name: Add upstream and fetch base
+        env:
+          ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
+          git fetch upstream "${{ env.RELAY_BASE }}"
 
-          cd upstream.git
+      # -------- Robust rebase loop with allowlisted auto-resolve, non-interactive --------
+      - name: Rebase onto upstream base (looping auto-resolve)
+        id: rebase
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_EDITOR=true
 
-          # git filter-repo drops remotes; recreate them now
-          git remote add origin "$UPSTREAM_URL" || git remote set-url origin "$UPSTREAM_URL"
-          git remote add mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}" || \
-            git remote set-url mirror "https://x-access-token:${GITHUB_TOKEN}@${MIRROR_URL#https://}"
+          # Quick path: try a straight rebase
+          if git rebase "upstream/${{ env.RELAY_BASE }}"; then
+            echo "conflict=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          # Ensure latest & prune deleted refs from upstream
-          git fetch --prune origin
+          echo "Rebase conflict detected — switching to controlled replay with auto-resolve loop."
+          git rebase --abort || true
 
-          # --- LFS support (mirror blobs as well) ---
-          # 1) Pull all LFS objects referenced in upstream
-          git lfs fetch origin --all || true
-          # 2) Push all LFS objects into the downstream mirror's LFS store
-          git lfs push mirror --all || true
+          git checkout -B __relay_work
+          git reset --hard "${{ steps.ctx.outputs.head_sha }}"
 
-          # For each requested branch, push only if SHA differs (skip no-ops)
-          for b in $BRANCHES; do
-            if git show-ref --verify --quiet "refs/heads/$b"; then
-              UP_SHA=$(git rev-parse "refs/heads/$b")
-              MIR_SHA=$(git ls-remote mirror "refs/heads/mirror/$b" | awk '{print $1}' || true)
-              if [ -n "${MIR_SHA}" ] && [ "$UP_SHA" = "$MIR_SHA" ]; then
-                echo "mirror/$b is up-to-date ($UP_SHA); skipping push."
-              else
-                echo "Pushing $b → mirror/$b ($UP_SHA != ${MIR_SHA:-none})"
-                git push mirror "refs/heads/$b:refs/heads/mirror/$b" $FORCE_FLAG
+          # Start rebase onto upstream base
+          git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
+
+          # Allowlist: prefer upstream ("theirs") for these paths when conflicted
+          ALLOWLIST=(
+            # infra/dev experience
+            ".devcontainer/devcontainer.json"
+            ".devcontainer/.*"
+            "docker-compose.yml"
+            "Dockerfile"
+
+            # dependency manifests & locks
+            "pyproject.toml"
+            "poetry.lock"
+            "package.json"
+            "package-lock.json"
+            "pnpm-lock.yaml"
+            "yarn.lock"
+
+            # Typical version constants
+            "src/.*/__init__\\.py"
+
+            # Never relay local workflows upstream
+            ".github/workflows/.*"
+          )
+
+          # Helper to check if a file path matches any allowlist regex
+          matches_allowlist () {
+            local f="$1"
+            for rx in "${ALLOWLIST[@]}"; do
+              if [[ "$f" =~ ^${rx}$ ]]; then
+                return 0
               fi
-            else
-              echo "Skip: upstream branch '$b' not found."
+            done
+            return 1
+          }
+
+          # Loop through rebase conflicts and resolve allowlisted files until done or a non-allowlisted conflict remains
+          iter=0
+          max_iter=50
+          while [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; do
+            ((iter++)) || true
+            if (( iter > max_iter )); then
+              echo "Hit iteration limit while rebasing; aborting."
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              git rebase --abort || true
+              exit 0
             fi
+
+            echo "Rebase auto-resolve iteration ${iter}…"
+            conflicted=$(git diff --name-only --diff-filter=U || true)
+            if [[ -z "$conflicted" ]]; then
+              # Rebase waiting for --continue without listed files
+              if git rebase --continue; then
+                continue
+              else
+                echo "conflict=true" >> "$GITHUB_OUTPUT"
+                git rebase --abort || true
+                exit 0
+              fi
+            fi
+
+            # Try to resolve allowlisted files
+            resolved_any=false
+            while IFS= read -r f; do
+              [[ -z "$f" ]] && continue
+              if matches_allowlist "$f"; then
+                echo "  • Auto-resolving (prefer upstream) $f"
+                git checkout --theirs -- "$f" || true
+                git add "$f" || true
+                resolved_any=true
+              else
+                echo "  • Non-allowlisted conflict: $f"
+                non_allowlisted=true
+              fi
+            done <<< "$conflicted"
+
+            # If we resolved at least one, try to continue; if non-allowlisted remain, stop and report
+            if [[ "${resolved_any}" == "true" ]]; then
+              if git rebase --continue; then
+                # continue loop; there may be more commits/conflicts ahead
+                continue
+              else
+                echo "conflict=true" >> "$GITHUB_OUTPUT"
+                git rebase --abort || true
+                exit 0
+              fi
+            fi
+
+            if [[ "${non_allowlisted:-}" == "true" ]]; then
+              echo "Remaining conflicts are not in allowlist; cannot auto-resolve safely."
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              git rebase --abort || true
+              exit 0
+            fi
+
+            # Fallback: nothing to do, but still stuck → abort
+            echo "Stuck during rebase without resolvable files."
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git rebase --abort || true
+            exit 0
           done
 
-          # Tags are where many release workflows trigger; default is OFF.
-          if [ "$PUSH_TAGS" = "true" ]; then
-            echo "Pushing tags (note: upstream workflows have been stripped)."
-            git fetch --tags origin
-            git push mirror --tags $FORCE_FLAG
-          else
-            echo "Skipping tags (push_tags=false)."
-          fi
+          echo "conflict=" >> "$GITHUB_OUTPUT"
 
-      - name: Summary
-        if: always()
-        run: echo "Mirror (workflows stripped + LFS mirrored) complete at $(date -u +"%Y-%m-%dT%H:%M:%SZ")."
+      - name: Comment on rebase conflict (downstream PR)
+        if: steps.rebase.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const body = [
+              "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
+              "",
+              "I looped through conflicts and auto-resolved common infra (`.devcontainer/**`, `docker-compose.yml`, `Dockerfile`),",
+              "dependency files (`pyproject.toml`, lockfiles, package.json/locks), version files (`src/**/__init__.py`),",
+              "and `.github/workflows/**` by favoring upstream, but **conflicts remain** outside that allowlist.",
+              "",
+              "**Action:** Rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again.",
+              "",
+              "**Tips:**",
+              "- Keep infra & dependency bumps out of Codex feature PRs when possible.",
+              "- If such changes are necessary, resolve locally so both repos agree."
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+            core.setFailed('Rebase conflict after auto-resolve')
+
+      # -------- Push relay branch to upstream and upsert PR --------
+      - name: Push relay branch to org
+        if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
+        env:
+          ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
+        run: |
+          set -euo pipefail
+          RELAY_BRANCH="relay/hh-pr-${{ steps.ctx.outputs.pr_number }}"
+          git push "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" HEAD:${RELAY_BRANCH} --force-with-lease
+          echo "RELAY_BRANCH=${RELAY_BRANCH}" >> $GITHUB_ENV
+
+      - name: Create or update PR in org
+        if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
+        id: upsert
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SYNC_PAT_ORG }}
+          script: |
+            const relayBranch = process.env.RELAY_BRANCH;
+            const owner = process.env.ORG_OWNER;
+            const repo  = process.env.ORG_REPO;
+            const base  = process.env.RELAY_BASE;
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
+
+            // Reuse downstream PR title/body
+            const { data: srcPR } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
+            });
+            const title = `Codex Relay: ${context.repo.owner}/${context.repo.repo} PR #${prNumber} — ${srcPR.title}`;
+            const body  = `Mirrored from **${context.repo.owner}/${context.repo.repo}** PR #${prNumber}\n\nSource: ${srcPR.html_url}\n\n> This PR is maintained by an automated relay. Changes should be made in the original HH PR.`;
+
+            const existing = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+            let url;
+            if (existing.length > 0) {
+              await github.rest.pulls.update({ owner, repo, pull_number: existing[0].number, title, body });
+              url = existing[0].html_url;
+            } else {
+              const pr = await github.rest.pulls.create({ owner, repo, head: relayBranch, base, title, body });
+              url = pr.data.html_url;
+            }
+            core.setOutput('org_pr_url', url)
+
+      - name: Comment upstream PR link on downstream PR
+        if: ${{ steps.upsert.outputs.org_pr_url }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const url = '${{ steps.upsert.outputs.org_pr_url }}'
+            const body = `🔁 Relay created/updated upstream PR: ${url}`
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body })
+
+      - name: Close matching org PR when HH PR closes
+        if: ${{ steps.ctx.outputs.is_closed == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SYNC_PAT_ORG }}
+          script: |
+            const owner = process.env.ORG_OWNER;
+            const repo  = process.env.ORG_REPO;
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const relayBranch = `relay/hh-pr-${prNumber}`;
+            const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+            for (const pr of prs) {
+              await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
+              core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
+            }
