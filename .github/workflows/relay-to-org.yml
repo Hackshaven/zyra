@@ -124,8 +124,8 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      # -------- Rebase with light auto-resolve for infra files --------
-      - name: Rebase onto upstream base (auto-resolve infra)
+      # -------- Rebase with light auto-resolve (infra + dependency manifests) --------
+      - name: Rebase onto upstream base (auto-resolve safe paths)
         id: rebase
         shell: bash
         run: |
@@ -137,7 +137,7 @@ jobs:
             exit 0
           fi
 
-          echo "Rebase conflict detected — attempting light auto-resolve for infra files."
+          echo "Rebase conflict detected — attempting light auto-resolve for known-safe paths."
           git rebase --abort || true
 
           # Start a controlled rebase: replay our commits onto upstream base
@@ -146,16 +146,23 @@ jobs:
           git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
 
           if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
-            # Allowlist of infra paths we always prefer from upstream
+            # Always prefer upstream ("theirs") for infra & dependency manifests
             ALLOWLIST=(
+              # infra/dev experience
               ".devcontainer/devcontainer.json"
               ".devcontainer/**"
               "docker-compose.yml"
+
+              # dependency manifests & locks
+              "pyproject.toml"
+              "poetry.lock"
+              "package.json"
+              "package-lock.json"
+              "pnpm-lock.yaml"
+              "yarn.lock"
             )
 
-            # Resolve conflicts for allowlisted files by taking 'theirs' (upstream)
             for pattern in "${ALLOWLIST[@]}"; do
-              # Convert glob to regex-ish for grep
               regex="^${pattern//\*/.*}$"
               matches=$(git diff --name-only --diff-filter=U | grep -E "${regex}" || true)
               if [ -n "${matches}" ]; then
@@ -169,7 +176,7 @@ jobs:
               fi
             done
 
-            # Continue rebase; if more conflicts remain, it will fail and we report them
+            # Continue rebase; if more conflicts remain, report & stop
             if ! git rebase --continue; then
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
@@ -188,12 +195,14 @@ jobs:
             const body = [
               "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
               "",
-              "I auto-resolved standard infra files (e.g. `.devcontainer/**`, `docker-compose.yml`) by favoring upstream,",
-              "but additional conflicts remain. Please rebase your branch on `mirror/staging` locally and push again.",
+              "I auto-resolved common infra files (`.devcontainer/**`, `docker-compose.yml`) and dependency manifests",
+              "(`pyproject.toml`, lockfiles, package.json/locks) by favoring upstream, but additional conflicts remain.",
+              "",
+              "**Action:** Please rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again.",
               "",
               "**Tips:**",
-              "- Keep infra changes (devcontainer / compose) out of Codex feature PRs when possible.",
-              "- If infra changes are required, resolve locally and re-push; the relay will retry automatically."
+              "- Keep infra & dependency bumps out of Codex feature PRs when possible.",
+              "- If dependency changes are required, resolve locally so both repos agree."
             ].join("\n");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
