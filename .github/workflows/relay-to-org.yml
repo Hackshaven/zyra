@@ -6,11 +6,10 @@ on:
     branches:
       - mirror/staging
       # - 'mirror/**'   # uncomment to allow any mirror/* base
-
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Downstream PR number in HacksHaven/zyra (optional: picks latest open mirror/* PR if empty)"
+        description: "Downstream PR number in HacksHaven/zyra (optional: selects latest open mirror/* PR if empty)"
         required: false
         type: number
 
@@ -69,8 +68,7 @@ jobs:
               pr = context.payload.pull_request;
             }
 
-            const sameRepo = pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
-            if (!sameRepo) {
+            if (pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
               core.setFailed(`PR head repo ${pr.head.repo.full_name} is not this repository; cannot access secrets.`);
               return;
             }
@@ -86,7 +84,6 @@ jobs:
             core.setOutput('head_sha', pr.head.sha);
             core.setOutput('head_repo', pr.head.repo.full_name);
             core.setOutput('is_closed', String(pr.state === 'closed'));
-            core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
 
       - name: Checkout PR head
         uses: actions/checkout@v4
@@ -117,24 +114,22 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      - name: Rebase onto upstream base (looping auto-resolve)
+      - name: Rebase onto upstream base (looping auto-resolve, LFS/binary-generic)
         id: rebase
         shell: bash
         run: |
           set -euo pipefail
           export GIT_EDITOR=true
 
-          # Start rebase; do NOT exit on failure — we will loop & resolve.
+          # Kick off rebase; keep going even if it errors, we'll resolve iteratively
           git rebase "upstream/${{ env.RELAY_BASE }}" || true
 
-          # Allowlist: prefer upstream ("theirs") for these when conflicted
-          # Use regex (bash [[ =~ ]]) not globs.
+          # Allowlist to favor upstream ("theirs")
           ALLOWLIST_REGEX=(
             # infra/dev
             "^\\.devcontainer/.*$"
             "^docker-compose\\.yml$"
             "^Dockerfile$"
-
             # dependency manifests & locks
             "^pyproject\\.toml$"
             "^poetry\\.lock$"
@@ -142,11 +137,9 @@ jobs:
             "^package-lock\\.json$"
             "^pnpm-lock\\.yaml$"
             "^yarn\\.lock$"
-
             # version constants (Python)
             "^src/.*/__init__\\.py$"
-
-            # never relay local workflows upstream
+            # workflows (never relay local)
             "^\\.github/workflows/.*$"
           )
 
@@ -160,9 +153,50 @@ jobs:
             return 1
           }
 
+          is_lfs_tracked () {
+            local f="$1"
+            # Requires .gitattributes present; returns 0 if filter=lfs
+            local out
+            out="$(git check-attr filter -- "$f" 2>/dev/null || true)"
+            [[ "$out" == *"filter: lfs"* ]]
+          }
+
+          is_binary_by_numstat () {
+            local f="$1"
+            # Binary files show -  - in numstat
+            local num
+            num="$(git diff --numstat -- "$f" 2>/dev/null || true)"
+            [[ "$num" == -*"-"* ]]
+          }
+
+          stage_has_lfs_pointer () {
+            # Check if a given stage (1=base,2=ours,3=theirs) looks like an LFS pointer
+            local stage="$1"; local f="$2"
+            git show ":${stage}:${f}" 2>/dev/null | head -n 1 | grep -q "version https://git-lfs.github.com/spec"
+          }
+
+          is_lfs_or_binary () {
+            local f="$1"
+            if is_lfs_tracked "$f"; then return 0; fi
+            if is_binary_by_numstat "$f"; then return 0; fi
+            # Fallback: pointer check in any stage
+            stage_has_lfs_pointer 1 "$f" && return 0
+            stage_has_lfs_pointer 2 "$f" && return 0
+            stage_has_lfs_pointer 3 "$f" && return 0
+            return 1
+          }
+
+          resolve_binary_like () {
+            local f="$1"
+            # Try deletion acceptance first (handles modify/delete)
+            git rm -f -- "$f" 2>/dev/null || true
+            # If deletion didn't apply, take upstream content
+            git checkout --theirs -- "$f" 2>/dev/null || true
+            git add -- "$f" 2>/dev/null || true
+          }
+
           iter=0
-          max_iter=120
-          # Loop while rebase is in progress
+          max_iter=200
           while [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; do
             ((iter++)) || true
             if (( iter > max_iter )); then
@@ -175,18 +209,14 @@ jobs:
             conflicted="$(git diff --name-only --diff-filter=U || true)"
 
             if [[ -z "$conflicted" ]]; then
-              # No conflicted files staged — try to continue; if it fails, stay in loop.
-              if git rebase --continue; then
-                continue
-              else
-                # keep looping; next iteration will re-check conflicts list
-                sleep 1
-                continue
-              fi
+              # Try to advance; if it fails, re-check next loop
+              git rebase --continue || { sleep 1; continue; }
+              continue
             fi
 
             resolved_any=false
-            non_allowlisted=false
+            non_allowlisted_text=false
+
             while IFS= read -r f; do
               [[ -z "$f" ]] && continue
               if matches_allowlist "$f"; then
@@ -194,26 +224,28 @@ jobs:
                 git checkout --theirs -- "$f" || true
                 git add "$f" || true
                 resolved_any=true
+              elif is_lfs_or_binary "$f"; then
+                echo "  • Auto-resolving (LFS/binary prefer upstream) $f"
+                resolve_binary_like "$f"
+                resolved_any=true
               else
-                echo "  • Non-allowlisted conflict: $f"
-                non_allowlisted=true
+                echo "  • Non-allowlisted, non-binary conflict: $f"
+                non_allowlisted_text=true
               fi
             done <<< "$conflicted"
 
             if [[ "$resolved_any" == "true" ]]; then
-              # Try to continue; if more conflicts remain, loop again
               git rebase --continue || true
               continue
             fi
 
-            if [[ "$non_allowlisted" == "true" ]]; then
-              echo "Remaining conflicts are not in allowlist; cannot auto-resolve safely."
+            if [[ "$non_allowlisted_text" == "true" ]]; then
+              echo "Remaining conflicts are outside allowlist and not binary/LFS; cannot auto-resolve safely."
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
               exit 0
             fi
 
-            # Fallback: nothing to resolve and can't continue → abort
             echo "Stuck during rebase without resolvable files."
             echo "conflict=true" >> "$GITHUB_OUTPUT"
             git rebase --abort || true
@@ -231,15 +263,12 @@ jobs:
             const body = [
               "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
               "",
-              "I looped and auto-resolved common infra (`.devcontainer/**`, `docker-compose.yml`, `Dockerfile`),",
-              "dependency files (`pyproject.toml`, lockfiles, package.json/locks), version files (`src/**/__init__.py`),",
-              "and `.github/workflows/**` by favoring upstream, but **conflicts remain** outside that allowlist.",
+              "I auto-resolved infra, dependency manifests/locks, version files, workflows, and **any LFS/binary files (detected generically)** by preferring upstream.",
+              "Conflicts remain in non-allowlisted text files.",
               "",
               "**Action:** Rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again.",
               "",
-              "**Tips:**",
-              "- Keep infra & dependency bumps out of Codex feature PRs when possible.",
-              "- If such changes are necessary, resolve locally so both repos agree."
+              "**Tip:** Keep large/binary asset changes out of Codex feature PRs when possible; coordinate them upstream directly."
             ].join("\n");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
