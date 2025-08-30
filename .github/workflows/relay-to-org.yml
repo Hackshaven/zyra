@@ -124,15 +124,15 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      # -------- Rebase with light auto-resolve (infra + dependency manifests) --------
+      # -------- Rebase with light auto-resolve (infra + dependency manifests), non-interactive --------
       - name: Rebase onto upstream base (auto-resolve safe paths)
         id: rebase
         shell: bash
         run: |
           set -euo pipefail
 
-          # First try a straight rebase
-          if git rebase "upstream/${{ env.RELAY_BASE }}"; then
+          # First try a straight rebase (non-interactive)
+          if GIT_EDITOR=true git rebase "upstream/${{ env.RELAY_BASE }}"; then
             echo "conflict=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -143,7 +143,7 @@ jobs:
           # Start a controlled rebase: replay our commits onto upstream base
           git checkout -B __relay_work
           git reset --hard "${{ steps.ctx.outputs.head_sha }}"
-          git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
+          GIT_EDITOR=true git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
 
           if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
             # Always prefer upstream ("theirs") for infra & dependency manifests
@@ -176,8 +176,8 @@ jobs:
               fi
             done
 
-            # Continue rebase; if more conflicts remain, report & stop
-            if ! git rebase --continue; then
+            # Continue rebase non-interactively; if more conflicts remain, report & stop
+            if ! GIT_EDITOR=true git rebase --continue; then
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
               exit 0
