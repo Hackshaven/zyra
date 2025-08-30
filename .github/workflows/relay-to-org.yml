@@ -1,34 +1,86 @@
 name: Relay Codex PRs to NOAA-GSL/zyra
 
 on:
-  pull_request:
+  # Auto: fires when a PR targets mirror/* (base branch)
+  pull_request_target:
     types: [opened, reopened, synchronize, edited, closed]
     branches:
       - mirror/staging
+      # - 'mirror/**'   # uncomment to allow other mirror bases too
+
+  # Manual: run from Actions tab with a PR number
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Downstream PR number in HacksHaven/zyra to relay"
+        required: true
+        type: number
 
 permissions:
   contents: read
   pull-requests: write
 
-# Prevent overlapping runs for the same PR
 concurrency:
-  group: relay-${{ github.event.pull_request.number }}
+  group: relay-${{ github.event_name }}-${{ github.event.inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
+
+env:
+  ORG_OWNER: NOAA-GSL
+  ORG_REPO: zyra
 
 jobs:
   relay:
     name: Mirror PR to org (create/update/close)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    # Skip PRs from forks (secrets not available there)
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    timeout-minutes: 12
 
     steps:
+      # -- Resolve PR metadata for both triggers --
+      - name: Resolve PR context (auto vs manual)
+        id: ctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isManual = context.eventName === 'workflow_dispatch';
+            let pr;
+            if (isManual) {
+              const prNumber = Number(core.getInput('pr_number', { required: true }));
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              pr = data;
+            } else {
+              pr = context.payload.pull_request;
+            }
+
+            // Ensure base is a mirror branch
+            if (!pr.base || !pr.base.ref.startsWith('mirror/')) {
+              core.setFailed(`Base branch '${pr.base?.ref}' is not a mirror/* branch.`);
+              return;
+            }
+
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_repo', pr.head.repo.full_name);
+            core.setOutput('action', isManual ? 'manual' : (context.payload.action || 'unknown'));
+            core.setOutput('is_closed', String(pr.state === 'closed'));
+            core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
+
+      # (Optional) skip if PR is closed and we’re not trying to close upstream
+      - name: Bail if closed (except we still post close below)
+        if: ${{ steps.ctx.outputs.is_closed == 'true' && github.event_name != 'pull_request_target' }}
+        run: echo "PR is closed; skip create/update. Close step will run later if needed."
+
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          # Use the PR's head repo/ref from the resolved context (works for both triggers)
+          repository: ${{ steps.ctx.outputs.head_repo }}
+          ref: ${{ steps.ctx.outputs.head_sha }}
           fetch-depth: 0
 
       - name: Configure Git
@@ -41,74 +93,99 @@ jobs:
           ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
         run: |
           set -euo pipefail
-          git ls-remote https://x-access-token:${ORG_TOKEN}@github.com/NOAA-GSL/zyra.git refs/heads/staging | grep -q . || \
-            (echo "::error ::NOAA-GSL/zyra:staging not found" && exit 1)
+          git ls-remote "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" refs/heads/staging | grep -q . || \
+            (echo "::error ::${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}:staging not found" && exit 1)
 
-      - name: Add upstream NOAA-GSL/zyra and fetch base
+      - name: Add upstream and fetch base
         env:
           ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
         run: |
           set -euo pipefail
-          git remote add upstream https://x-access-token:${ORG_TOKEN}@github.com/NOAA-GSL/zyra.git
+          git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream staging
 
-      - name: Rebase onto org staging (fail loudly if conflict)
+      - name: Rebase onto org staging (comment on conflict)
+        id: rebase
         run: |
           set -e
-          git rebase upstream/staging || (git rebase --abort && echo "::error ::Rebase conflict; resolve upstream divergences" && exit 1)
+          if ! git rebase upstream/staging; then
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on rebase conflict (downstream PR)
+        if: steps.rebase.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const body = `❌ Relay rebase failed on **${process.env.ORG_OWNER}/${process.env.ORG_REPO}:staging**.\n\nPlease rebase this branch onto \`mirror/staging\` and push again. The relay will retry automatically.`
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body })
+            core.setFailed('Rebase conflict')
 
       - name: Push relay branch to org
-        if: ${{ github.event.action != 'closed' }}
+        if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
         env:
           ORG_TOKEN: ${{ secrets.SYNC_PAT_ORG }}
         run: |
           set -euo pipefail
-          RELAY_BRANCH="relay/hh-pr-${{ github.event.pull_request.number }}"
-          git push https://x-access-token:${ORG_TOKEN}@github.com/NOAA-GSL/zyra.git HEAD:${RELAY_BRANCH} --force-with-lease
+          RELAY_BRANCH="relay/hh-pr-${{ steps.ctx.outputs.pr_number }}"
+          git push "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" HEAD:${RELAY_BRANCH} --force-with-lease
           echo "RELAY_BRANCH=${RELAY_BRANCH}" >> $GITHUB_ENV
 
       - name: Create or update PR in org
-        if: ${{ github.event.action != 'closed' }}
+        if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
+        id: upsert
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_PAT_ORG }}
           script: |
             const relayBranch = process.env.RELAY_BRANCH;
-            const owner = 'NOAA-GSL';
-            const repo  = 'zyra';
+            const owner = process.env.ORG_OWNER;
+            const repo  = process.env.ORG_REPO;
             const base  = 'staging';
-            const srcPR = context.payload.pull_request;
-            const title = `Codex Relay: HacksHaven PR #${srcPR.number} — ${srcPR.title}`;
-            const body  = `Mirrored from **HacksHaven/zyra** PR #${srcPR.number}\n\nSource: ${srcPR.html_url}\n\n> This PR is maintained by an automated relay. Changes should be made in the original HH PR.`;
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
 
-            // find existing open PR from this relay branch
-            const existing = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state: 'open', head: `${owner}:${relayBranch}`
+            // Load downstream PR to reuse title/body
+            const { data: srcPR } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
             });
+            const title = `Codex Relay: ${context.repo.owner}/${context.repo.repo} PR #${prNumber} — ${srcPR.title}`;
+            const body  = `Mirrored from **${context.repo.owner}/${context.repo.repo}** PR #${prNumber}\n\nSource: ${srcPR.html_url}\n\n> This PR is maintained by an automated relay. Changes should be made in the original HH PR.`;
 
+            const existing = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+            let url;
             if (existing.length > 0) {
-              await github.rest.pulls.update({
-                owner, repo, pull_number: existing[0].number, title, body
-              });
-              core.info(`Updated org PR #${existing[0].number}`);
+              await github.rest.pulls.update({ owner, repo, pull_number: existing[0].number, title, body });
+              url = existing[0].html_url;
             } else {
               const pr = await github.rest.pulls.create({ owner, repo, head: relayBranch, base, title, body });
-              core.info(`Created org PR ${pr.data.html_url}`);
+              url = pr.data.html_url;
             }
+            core.setOutput('org_pr_url', url);
+
+      - name: Comment upstream PR link on downstream PR
+        if: ${{ steps.upsert.outputs.org_pr_url }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const url = '${{ steps.upsert.outputs.org_pr_url }}'
+            const body = `🔁 Relay created/updated upstream PR: ${url}`
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body })
 
       - name: Close matching org PR when HH PR closes
-        if: ${{ github.event.action == 'closed' }}
+        if: ${{ steps.ctx.outputs.is_closed == 'true' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_PAT_ORG }}
           script: |
-            const owner = 'NOAA-GSL';
-            const repo  = 'zyra';
-            const relayBranch = `relay/hh-pr-${context.payload.number}`;
-            const prs = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state: 'open', head: `${owner}:${relayBranch}`
-            });
+            const owner = process.env.ORG_OWNER;
+            const repo  = process.env.ORG_REPO;
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const relayBranch = `relay/hh-pr-${prNumber}`;
+            const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
             for (const pr of prs) {
               await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
-              core.info(`Closed org PR #${pr.number} because HH PR was closed.`);
+              core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
             }
