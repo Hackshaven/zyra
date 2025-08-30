@@ -1,11 +1,15 @@
+# .github/workflows/relay-to-org.yml
 name: Relay Codex PRs to NOAA-GSL/zyra
 
 on:
+  # Auto: run when a PR targets a mirror branch (base = mirror/staging)
   pull_request_target:
     types: [opened, reopened, synchronize, edited, closed]
     branches:
       - mirror/staging
       # - 'mirror/**'   # uncomment to allow any mirror/* base
+
+  # Manual: run from Actions tab with optional PR number
   workflow_dispatch:
     inputs:
       pr_number:
@@ -33,6 +37,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # -------- Resolve PR context for both triggers (auto + manual) --------
       - name: Resolve PR context
         id: ctx
         uses: actions/github-script@v7
@@ -52,6 +57,7 @@ jobs:
                 });
                 pr = data;
               } else {
+                // pick the latest open PR targeting mirror/*
                 const list = await github.paginate(github.rest.pulls.list, {
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -68,6 +74,7 @@ jobs:
               pr = context.payload.pull_request;
             }
 
+            // Fork guard: require same-repo PR (secrets unavailable for forks)
             const sameRepo = pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
             if (!sameRepo) {
               core.setFailed(`PR head repo ${pr.head.repo.full_name} is not this repository; cannot access secrets.`);
@@ -87,6 +94,7 @@ jobs:
             core.setOutput('is_closed', String(pr.state === 'closed'));
             core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
 
+      # -------- Checkout the PR head (PR_TARGET loads workflow from default branch) --------
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
@@ -116,6 +124,7 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
+      # -------- Rebase with light auto-resolve (infra + dependency manifests), non-interactive --------
       - name: Rebase onto upstream base (auto-resolve safe paths)
         id: rebase
         shell: bash
@@ -123,7 +132,7 @@ jobs:
           set -euo pipefail
           export GIT_EDITOR=true
 
-          # Quick, non-interactive try
+          # First try a straight rebase (non-interactive)
           if git rebase "upstream/${{ env.RELAY_BASE }}"; then
             echo "conflict=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -132,19 +141,21 @@ jobs:
           echo "Rebase conflict detected — attempting light auto-resolve for known-safe paths."
           git rebase --abort || true
 
-          # Controlled replay onto upstream base
+          # Start a controlled rebase: replay our commits onto upstream base
           git checkout -B __relay_work
           git reset --hard "${{ steps.ctx.outputs.head_sha }}"
           git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
 
           if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
-            # Prefer upstream ("theirs") for infra, dependency manifests/locks, version files, and upstream workflows
+            # Always prefer upstream ("theirs") for infra & dependency manifests
             ALLOWLIST=(
+              # infra/dev experience
               ".devcontainer/devcontainer.json"
               ".devcontainer/**"
               "docker-compose.yml"
               "Dockerfile"
 
+              # dependency manifests & locks
               "pyproject.toml"
               "poetry.lock"
               "package.json"
@@ -173,7 +184,7 @@ jobs:
               fi
             done
 
-            # Continue rebase non-interactively
+            # Continue rebase non-interactively; if more conflicts remain, report & stop
             if ! git rebase --continue; then
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
@@ -211,6 +222,7 @@ jobs:
             });
             core.setFailed('Rebase conflict after auto-resolve')
 
+      # -------- Push relay branch to upstream and upsert PR --------
       - name: Push relay branch to org
         if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
         env:
@@ -218,7 +230,7 @@ jobs:
         run: |
           set -euo pipefail
           RELAY_BRANCH="relay/hh-pr-${{ steps.ctx.outputs.pr_number }}"
-          git push "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORg_REPO }}.git" HEAD:${RELAY_BRANCH} --force-with-lease
+          git push "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git" HEAD:${RELAY_BRANCH} --force-with-lease
           echo "RELAY_BRANCH=${RELAY_BRANCH}" >> $GITHUB_ENV
 
       - name: Create or update PR in org
@@ -227,29 +239,30 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_PAT_ORG }}
-        script: |
-          const relayBranch = process.env.RELAY_BRANCH;
-          const owner = process.env.ORG_OWNER;
-          const repo  = process.env.ORG_REPO;
-          const base  = process.env.RELAY_BASE;
-          const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
+          script: |
+            const relayBranch = process.env.RELAY_BRANCH;
+            const owner = process.env.ORG_OWNER;
+            const repo  = process.env.ORG_REPO;
+            const base  = process.env.RELAY_BASE;
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
 
-          const { data: srcPR } = await github.rest.pulls.get({
-            owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
-          });
-          const title = `Codex Relay: ${context.repo.owner}/${context.repo.repo} PR #${prNumber} — ${srcPR.title}`;
-          const body  = `Mirrored from **${context.repo.owner}/${context.repo.repo}** PR #${prNumber}\n\nSource: ${srcPR.html_url}\n\n> This PR is maintained by an automated relay. Changes should be made in the original HH PR.`;
+            // Reuse downstream PR title/body
+            const { data: srcPR } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
+            });
+            const title = `Codex Relay: ${context.repo.owner}/${context.repo.repo} PR #${prNumber} — ${srcPR.title}`;
+            const body  = `Mirrored from **${context.repo.owner}/${context.repo.repo}** PR #${prNumber}\n\nSource: ${srcPR.html_url}\n\n> This PR is maintained by an automated relay. Changes should be made in the original HH PR.`;
 
-          const existing = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
-          let url;
-          if (existing.length > 0) {
-            await github.rest.pulls.update({ owner, repo, pull_number: existing[0].number, title, body });
-            url = existing[0].html_url;
-          } else {
-            const pr = await github.rest.pulls.create({ owner, repo, head: relayBranch, base, title, body });
-            url = pr.data.html_url;
-          }
-          core.setOutput('org_pr_url', url)
+            const existing = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+            let url;
+            if (existing.length > 0) {
+              await github.rest.pulls.update({ owner, repo, pull_number: existing[0].number, title, body });
+              url = existing[0].html_url;
+            } else {
+              const pr = await github.rest.pulls.create({ owner, repo, head: relayBranch, base, title, body });
+              url = pr.data.html_url;
+            }
+            core.setOutput('org_pr_url', url)
 
       - name: Comment upstream PR link on downstream PR
         if: ${{ steps.upsert.outputs.org_pr_url }}
