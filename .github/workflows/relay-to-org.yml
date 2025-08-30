@@ -1,14 +1,12 @@
 name: Relay Codex PRs to NOAA-GSL/zyra
 
 on:
-  # Auto: run when a PR targets a mirror branch (base = mirror/staging)
   pull_request_target:
     types: [opened, reopened, synchronize, edited, closed]
     branches:
       - mirror/staging
       # - 'mirror/**'   # uncomment to allow any mirror/* base
 
-  # Manual: run from Actions tab with optional PR number
   workflow_dispatch:
     inputs:
       pr_number:
@@ -36,7 +34,6 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # -------- Resolve PR context for both triggers (auto + manual) --------
       - name: Resolve PR context
         id: ctx
         uses: actions/github-script@v7
@@ -56,7 +53,6 @@ jobs:
                 });
                 pr = data;
               } else {
-                // pick the latest open PR targeting mirror/*
                 const list = await github.paginate(github.rest.pulls.list, {
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -73,7 +69,6 @@ jobs:
               pr = context.payload.pull_request;
             }
 
-            // Fork guard: require same-repo PR (secrets unavailable for forks)
             const sameRepo = pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
             if (!sameRepo) {
               core.setFailed(`PR head repo ${pr.head.repo.full_name} is not this repository; cannot access secrets.`);
@@ -93,7 +88,6 @@ jobs:
             core.setOutput('is_closed', String(pr.state === 'closed'));
             core.info(`Relay context → PR #${pr.number} ${pr.head.repo.full_name}:${pr.head.ref} -> ${pr.base.ref}`);
 
-      # -------- Checkout the PR head (pull_request_target loads workflow from default branch) --------
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
@@ -123,7 +117,6 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      # -------- Robust rebase loop with allowlisted auto-resolve, non-interactive --------
       - name: Rebase onto upstream base (looping auto-resolve)
         id: rebase
         shell: bash
@@ -131,82 +124,69 @@ jobs:
           set -euo pipefail
           export GIT_EDITOR=true
 
-          # Quick path: try a straight rebase
-          if git rebase "upstream/${{ env.RELAY_BASE }}"; then
-            echo "conflict=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Start rebase; do NOT exit on failure — we will loop & resolve.
+          git rebase "upstream/${{ env.RELAY_BASE }}" || true
 
-          echo "Rebase conflict detected — switching to controlled replay with auto-resolve loop."
-          git rebase --abort || true
-
-          git checkout -B __relay_work
-          git reset --hard "${{ steps.ctx.outputs.head_sha }}"
-
-          # Start rebase onto upstream base
-          git rebase --onto "upstream/${{ env.RELAY_BASE }}" "$(git merge-base HEAD "upstream/${{ env.RELAY_BASE }}")" HEAD || true
-
-          # Allowlist: prefer upstream ("theirs") for these paths when conflicted
-          ALLOWLIST=(
-            # infra/dev experience
-            ".devcontainer/devcontainer.json"
-            ".devcontainer/.*"
-            "docker-compose.yml"
-            "Dockerfile"
+          # Allowlist: prefer upstream ("theirs") for these when conflicted
+          # Use regex (bash [[ =~ ]]) not globs.
+          ALLOWLIST_REGEX=(
+            # infra/dev
+            "^\\.devcontainer/.*$"
+            "^docker-compose\\.yml$"
+            "^Dockerfile$"
 
             # dependency manifests & locks
-            "pyproject.toml"
-            "poetry.lock"
-            "package.json"
-            "package-lock.json"
-            "pnpm-lock.yaml"
-            "yarn.lock"
+            "^pyproject\\.toml$"
+            "^poetry\\.lock$"
+            "^package\\.json$"
+            "^package-lock\\.json$"
+            "^pnpm-lock\\.yaml$"
+            "^yarn\\.lock$"
 
-            # Typical version constants
-            "src/.*/__init__\\.py"
+            # version constants (Python)
+            "^src/.*/__init__\\.py$"
 
-            # Never relay local workflows upstream
-            ".github/workflows/.*"
+            # never relay local workflows upstream
+            "^\\.github/workflows/.*$"
           )
 
-          # Helper to check if a file path matches any allowlist regex
           matches_allowlist () {
             local f="$1"
-            for rx in "${ALLOWLIST[@]}"; do
-              if [[ "$f" =~ ^${rx}$ ]]; then
+            for rx in "${ALLOWLIST_REGEX[@]}"; do
+              if [[ "$f" =~ $rx ]]; then
                 return 0
               fi
             done
             return 1
           }
 
-          # Loop through rebase conflicts and resolve allowlisted files until done or a non-allowlisted conflict remains
           iter=0
-          max_iter=50
+          max_iter=120
+          # Loop while rebase is in progress
           while [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; do
             ((iter++)) || true
             if (( iter > max_iter )); then
-              echo "Hit iteration limit while rebasing; aborting."
+              echo "Iteration cap hit during rebase; aborting."
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
               exit 0
             fi
 
-            echo "Rebase auto-resolve iteration ${iter}…"
-            conflicted=$(git diff --name-only --diff-filter=U || true)
+            conflicted="$(git diff --name-only --diff-filter=U || true)"
+
             if [[ -z "$conflicted" ]]; then
-              # Rebase waiting for --continue without listed files
+              # No conflicted files staged — try to continue; if it fails, stay in loop.
               if git rebase --continue; then
                 continue
               else
-                echo "conflict=true" >> "$GITHUB_OUTPUT"
-                git rebase --abort || true
-                exit 0
+                # keep looping; next iteration will re-check conflicts list
+                sleep 1
+                continue
               fi
             fi
 
-            # Try to resolve allowlisted files
             resolved_any=false
+            non_allowlisted=false
             while IFS= read -r f; do
               [[ -z "$f" ]] && continue
               if matches_allowlist "$f"; then
@@ -220,26 +200,20 @@ jobs:
               fi
             done <<< "$conflicted"
 
-            # If we resolved at least one, try to continue; if non-allowlisted remain, stop and report
-            if [[ "${resolved_any}" == "true" ]]; then
-              if git rebase --continue; then
-                # continue loop; there may be more commits/conflicts ahead
-                continue
-              else
-                echo "conflict=true" >> "$GITHUB_OUTPUT"
-                git rebase --abort || true
-                exit 0
-              fi
+            if [[ "$resolved_any" == "true" ]]; then
+              # Try to continue; if more conflicts remain, loop again
+              git rebase --continue || true
+              continue
             fi
 
-            if [[ "${non_allowlisted:-}" == "true" ]]; then
+            if [[ "$non_allowlisted" == "true" ]]; then
               echo "Remaining conflicts are not in allowlist; cannot auto-resolve safely."
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
               exit 0
             fi
 
-            # Fallback: nothing to do, but still stuck → abort
+            # Fallback: nothing to resolve and can't continue → abort
             echo "Stuck during rebase without resolvable files."
             echo "conflict=true" >> "$GITHUB_OUTPUT"
             git rebase --abort || true
@@ -257,7 +231,7 @@ jobs:
             const body = [
               "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
               "",
-              "I looped through conflicts and auto-resolved common infra (`.devcontainer/**`, `docker-compose.yml`, `Dockerfile`),",
+              "I looped and auto-resolved common infra (`.devcontainer/**`, `docker-compose.yml`, `Dockerfile`),",
               "dependency files (`pyproject.toml`, lockfiles, package.json/locks), version files (`src/**/__init__.py`),",
               "and `.github/workflows/**` by favoring upstream, but **conflicts remain** outside that allowlist.",
               "",
@@ -275,7 +249,6 @@ jobs:
             });
             core.setFailed('Rebase conflict after auto-resolve')
 
-      # -------- Push relay branch to upstream and upsert PR --------
       - name: Push relay branch to org
         if: ${{ steps.rebase.outputs.conflict != 'true' && steps.ctx.outputs.is_closed != 'true' }}
         env:
@@ -299,7 +272,6 @@ jobs:
             const base  = process.env.RELAY_BASE;
             const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
 
-            // Reuse downstream PR title/body
             const { data: srcPR } = await github.rest.pulls.get({
               owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
             });
