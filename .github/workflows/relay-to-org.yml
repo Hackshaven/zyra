@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Downstream PR number in HacksHaven/zyra (optional: picks latest open mirror/* PR if empty)"
+        description: "Downstream PR number in HacksHaven/zyra (optional)"
         required: false
         type: number
 
@@ -113,36 +113,31 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      - name: Rebase onto upstream base (auto-resolve with allowlists + LFS/binary)
+      - name: Rebase onto upstream base (auto-resolve: infra + docs + LFS/binary)
         id: rebase
         shell: bash
         run: |
           set -euo pipefail
           export GIT_EDITOR=true
 
-          # Start the rebase; we'll iterate to resolve conflicts.
+          # Start the rebase; we'll iterate and resolve.
           git rebase "upstream/${{ env.RELAY_BASE }}" || true
 
-          # ----- allowlists -----
-          # Infra / Dev
+          # Allowlists
           ALLOWLIST_REGEX=(
             "^\\.devcontainer/.*$"
             "^docker-compose\\.yml$"
             "^Dockerfile$"
-            # Dependency manifests & locks
             "^pyproject\\.toml$"
             "^poetry\\.lock$"
             "^package\\.json$"
             "^package-lock\\.json$"
             "^pnpm-lock\\.yaml$"
             "^yarn\\.lock$"
-            # Version constants
             "^src/.*/__init__\\.py$"
-            # Workflows
             "^\\.github/workflows/.*$"
           )
 
-          # Docs: prefer upstream to avoid downstream-only docs bleeding into org
           DOCS_ALLOWLIST_REGEX=(
             "^README\\.md$"
             "^AGENTS\\.md$"
@@ -151,37 +146,28 @@ jobs:
           )
 
           matches_any () {
-            local f="$1"
-            shift
-            for rx in "$@"; do
-              if [[ "$f" =~ $rx ]]; then return 0; fi
-            done
+            local f="$1"; shift
+            for rx in "$@"; do [[ "$f" =~ $rx ]] && return 0; done
             return 1
           }
 
           is_lfs_tracked () {
-            local f="$1"
-            local out
-            out="$(git check-attr filter -- "$f" 2>/dev/null || true)"
-            [[ "$out" == *"filter: lfs"* ]]
+            git check-attr filter -- "$1" 2>/dev/null | grep -q "filter: lfs"
           }
 
           is_binary_by_numstat () {
-            local f="$1"
-            local num
-            num="$(git diff --numstat -- "$f" 2>/dev/null || true)"
+            local num; num="$(git diff --numstat -- "$1" 2>/dev/null || true)"
             [[ "$num" == -*"-"* ]]
           }
 
           stage_has_lfs_pointer () {
-            local stage="$1"; local f="$2"
-            git show ":${stage}:${f}" 2>/dev/null | head -n 1 | grep -q "version https://git-lfs.github.com/spec"
+            git show ":$1:$2" 2>/dev/null | head -n 1 | grep -q "version https://git-lfs.github.com/spec"
           }
 
           is_lfs_or_binary () {
             local f="$1"
-            if is_lfs_tracked "$f"; then return 0; fi
-            if is_binary_by_numstat "$f"; then return 0; fi
+            is_lfs_tracked "$f" && return 0
+            is_binary_by_numstat "$f" && return 0
             stage_has_lfs_pointer 1 "$f" && return 0
             stage_has_lfs_pointer 2 "$f" && return 0
             stage_has_lfs_pointer 3 "$f" && return 0
@@ -190,7 +176,7 @@ jobs:
 
           resolve_binary_like () {
             local f="$1"
-            git rm -f -- "$f" 2>/dev/null || true       # handles modify/delete
+            git rm -f -- "$f" 2>/dev/null || true
             git checkout --theirs -- "$f" 2>/dev/null || true
             git add -- "$f" 2>/dev/null || true
           }
@@ -207,7 +193,6 @@ jobs:
             fi
 
             conflicted="$(git diff --name-only --diff-filter=U || true)"
-
             if [[ -z "$conflicted" ]]; then
               git rebase --continue || { sleep 1; continue; }
               continue
@@ -348,12 +333,13 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_PAT_ORG }}
-        script: |
-          const owner = process.env.ORG_OWNER;
-          const repo  = process.env.ORG_REPO;
-          const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
-          const relayBranch = `relay/hh-pr-${prNumber}`;
-          const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
-          for (const pr of prs) {
-            await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
-            core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
+          script: |
+            const owner = process.env.ORG_OWNER;
+            const repo  = process.env.ORG_REPO;
+            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+            const relayBranch = `relay/hh-pr-${prNumber}`;
+            const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+            for (const pr of prs) {
+              await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
+              core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
+            }
