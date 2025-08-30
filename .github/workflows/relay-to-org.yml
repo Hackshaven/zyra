@@ -5,11 +5,10 @@ on:
     types: [opened, reopened, synchronize, edited, closed]
     branches:
       - mirror/staging
-      # - 'mirror/**'   # uncomment to allow any mirror/* base
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Downstream PR number in HacksHaven/zyra (optional: selects latest open mirror/* PR if empty)"
+        description: "Downstream PR number in HacksHaven/zyra (optional: picks latest open mirror/* PR if empty)"
         required: false
         type: number
 
@@ -114,48 +113,54 @@ jobs:
           git remote add upstream "https://x-access-token:${ORG_TOKEN}@github.com/${{ env.ORG_OWNER }}/${{ env.ORG_REPO }}.git"
           git fetch upstream "${{ env.RELAY_BASE }}"
 
-      - name: Rebase onto upstream base (looping auto-resolve, LFS/binary-generic)
+      - name: Rebase onto upstream base (auto-resolve with allowlists + LFS/binary)
         id: rebase
         shell: bash
         run: |
           set -euo pipefail
           export GIT_EDITOR=true
 
-          # Kick off rebase; keep going even if it errors, we'll resolve iteratively
+          # Start the rebase; we'll iterate to resolve conflicts.
           git rebase "upstream/${{ env.RELAY_BASE }}" || true
 
-          # Allowlist to favor upstream ("theirs")
+          # ----- allowlists -----
+          # Infra / Dev
           ALLOWLIST_REGEX=(
-            # infra/dev
             "^\\.devcontainer/.*$"
             "^docker-compose\\.yml$"
             "^Dockerfile$"
-            # dependency manifests & locks
+            # Dependency manifests & locks
             "^pyproject\\.toml$"
             "^poetry\\.lock$"
             "^package\\.json$"
             "^package-lock\\.json$"
             "^pnpm-lock\\.yaml$"
             "^yarn\\.lock$"
-            # version constants (Python)
+            # Version constants
             "^src/.*/__init__\\.py$"
-            # workflows (never relay local)
+            # Workflows
             "^\\.github/workflows/.*$"
           )
 
-          matches_allowlist () {
+          # Docs: prefer upstream to avoid downstream-only docs bleeding into org
+          DOCS_ALLOWLIST_REGEX=(
+            "^README\\.md$"
+            "^AGENTS\\.md$"
+            "^CONTRIBUTING\\.md$"
+            "^docs/.*\\.md$"
+          )
+
+          matches_any () {
             local f="$1"
-            for rx in "${ALLOWLIST_REGEX[@]}"; do
-              if [[ "$f" =~ $rx ]]; then
-                return 0
-              fi
+            shift
+            for rx in "$@"; do
+              if [[ "$f" =~ $rx ]]; then return 0; fi
             done
             return 1
           }
 
           is_lfs_tracked () {
             local f="$1"
-            # Requires .gitattributes present; returns 0 if filter=lfs
             local out
             out="$(git check-attr filter -- "$f" 2>/dev/null || true)"
             [[ "$out" == *"filter: lfs"* ]]
@@ -163,14 +168,12 @@ jobs:
 
           is_binary_by_numstat () {
             local f="$1"
-            # Binary files show -  - in numstat
             local num
             num="$(git diff --numstat -- "$f" 2>/dev/null || true)"
             [[ "$num" == -*"-"* ]]
           }
 
           stage_has_lfs_pointer () {
-            # Check if a given stage (1=base,2=ours,3=theirs) looks like an LFS pointer
             local stage="$1"; local f="$2"
             git show ":${stage}:${f}" 2>/dev/null | head -n 1 | grep -q "version https://git-lfs.github.com/spec"
           }
@@ -179,7 +182,6 @@ jobs:
             local f="$1"
             if is_lfs_tracked "$f"; then return 0; fi
             if is_binary_by_numstat "$f"; then return 0; fi
-            # Fallback: pointer check in any stage
             stage_has_lfs_pointer 1 "$f" && return 0
             stage_has_lfs_pointer 2 "$f" && return 0
             stage_has_lfs_pointer 3 "$f" && return 0
@@ -188,9 +190,7 @@ jobs:
 
           resolve_binary_like () {
             local f="$1"
-            # Try deletion acceptance first (handles modify/delete)
-            git rm -f -- "$f" 2>/dev/null || true
-            # If deletion didn't apply, take upstream content
+            git rm -f -- "$f" 2>/dev/null || true       # handles modify/delete
             git checkout --theirs -- "$f" 2>/dev/null || true
             git add -- "$f" 2>/dev/null || true
           }
@@ -209,7 +209,6 @@ jobs:
             conflicted="$(git diff --name-only --diff-filter=U || true)"
 
             if [[ -z "$conflicted" ]]; then
-              # Try to advance; if it fails, re-check next loop
               git rebase --continue || { sleep 1; continue; }
               continue
             fi
@@ -219,15 +218,24 @@ jobs:
 
             while IFS= read -r f; do
               [[ -z "$f" ]] && continue
-              if matches_allowlist "$f"; then
+
+              if matches_any "$f" "${ALLOWLIST_REGEX[@]}"; then
                 echo "  • Auto-resolving (prefer upstream) $f"
                 git checkout --theirs -- "$f" || true
                 git add "$f" || true
                 resolved_any=true
+
+              elif matches_any "$f" "${DOCS_ALLOWLIST_REGEX[@]}"; then
+                echo "  • Auto-resolving DOCS (prefer upstream) $f"
+                git checkout --theirs -- "$f" || true
+                git add "$f" || true
+                resolved_any=true
+
               elif is_lfs_or_binary "$f"; then
                 echo "  • Auto-resolving (LFS/binary prefer upstream) $f"
                 resolve_binary_like "$f"
                 resolved_any=true
+
               else
                 echo "  • Non-allowlisted, non-binary conflict: $f"
                 non_allowlisted_text=true
@@ -240,7 +248,7 @@ jobs:
             fi
 
             if [[ "$non_allowlisted_text" == "true" ]]; then
-              echo "Remaining conflicts are outside allowlist and not binary/LFS; cannot auto-resolve safely."
+              echo "Remaining conflicts are outside allowlists and not binary/LFS; cannot auto-resolve safely."
               echo "conflict=true" >> "$GITHUB_OUTPUT"
               git rebase --abort || true
               exit 0
@@ -263,12 +271,10 @@ jobs:
             const body = [
               "❌ Relay rebase hit conflicts against **" + process.env.ORG_OWNER + "/" + process.env.ORG_REPO + ":" + process.env.RELAY_BASE + "**.",
               "",
-              "I auto-resolved infra, dependency manifests/locks, version files, workflows, and **any LFS/binary files (detected generically)** by preferring upstream.",
-              "Conflicts remain in non-allowlisted text files.",
+              "I auto-resolved infra, dependency manifests/locks, version files, workflows, **docs (README/AGENTS/docs/**)**,",
+              "and all LFS/binary files by preferring upstream, but some text conflicts remain.",
               "",
-              "**Action:** Rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again.",
-              "",
-              "**Tip:** Keep large/binary asset changes out of Codex feature PRs when possible; coordinate them upstream directly."
+              "**Action:** Rebase your branch on `mirror/staging` locally, resolve remaining conflicts, and push again."
             ].join("\n");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -302,12 +308,16 @@ jobs:
             const prNumber = Number('${{ steps.ctx.outputs.pr_number }}');
 
             const { data: srcPR } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
             });
             const title = `Codex Relay: ${context.repo.owner}/${context.repo.repo} PR #${prNumber} — ${srcPR.title}`;
             const body  = `Mirrored from **${context.repo.owner}/${context.repo.repo}** PR #${prNumber}\n\nSource: ${srcPR.html_url}\n\n> This PR is maintained by an automated relay. Changes should be made in the original HH PR.`;
 
-            const existing = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+            const existing = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', head: `${owner}:${relayBranch}`
+            });
             let url;
             if (existing.length > 0) {
               await github.rest.pulls.update({ owner, repo, pull_number: existing[0].number, title, body });
@@ -326,20 +336,24 @@ jobs:
             const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
             const url = '${{ steps.upsert.outputs.org_pr_url }}'
             const body = `🔁 Relay created/updated upstream PR: ${url}`
-            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body })
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            })
 
       - name: Close matching org PR when HH PR closes
         if: ${{ steps.ctx.outputs.is_closed == 'true' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.SYNC_PAT_ORG }}
-          script: |
-            const owner = process.env.ORG_OWNER;
-            const repo  = process.env.ORG_REPO;
-            const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
-            const relayBranch = `relay/hh-pr-${prNumber}`;
-            const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
-            for (const pr of prs) {
-              await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
-              core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
-            }
+        script: |
+          const owner = process.env.ORG_OWNER;
+          const repo  = process.env.ORG_REPO;
+          const prNumber = Number('${{ steps.ctx.outputs.pr_number }}')
+          const relayBranch = `relay/hh-pr-${prNumber}`;
+          const prs = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', head: `${owner}:${relayBranch}` });
+          for (const pr of prs) {
+            await github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'closed' });
+            core.info(`Closed org PR #${pr.number} because HH PR #${prNumber} was closed.`);
